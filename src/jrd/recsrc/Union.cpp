@@ -23,6 +23,7 @@
 #include "../jrd/cmp_proto.h"
 #include "../jrd/exe_proto.h"
 #include "../jrd/vio_proto.h"
+#include "../dsql/ExprNodes.h"
 
 #include "RecordSource.h"
 
@@ -37,7 +38,7 @@ Union::Union(CompilerScratch* csb, StreamType stream,
 			 FB_SIZE_T argCount, RecordSource* const* args, NestConst<MapNode>* maps,
 			 const StreamList& streams)
 	: RecordStream(csb, stream), m_args(csb->csb_pool, argCount), m_maps(csb->csb_pool, argCount),
-	  m_streams(csb->csb_pool, streams)
+	  m_compiledMaps(csb->csb_pool), m_streams(csb->csb_pool, streams)
 {
 	fb_assert(argCount);
 
@@ -51,6 +52,76 @@ Union::Union(CompilerScratch* csb, StreamType stream,
 		m_args[i] = args[i];
 		m_cardinality += args[i]->getCardinality();
 		m_maps[i] = maps[i];
+	}
+
+	thread_db* const tdbb = JRD_get_thread_data();
+
+	for (FB_SIZE_T i = 0; i < argCount; i++)
+	{
+		Array<CompiledMapItem>& items = m_compiledMaps.add();
+		compileMap(tdbb, csb, m_maps[i], items);
+	}
+}
+
+// Precompile the map assignments. Field-to-field assignments between
+// equivalent descriptors are marked for a direct byte copy at runtime,
+// the others keep the generic EXE_assignment path.
+void Union::compileMap(thread_db* tdbb, CompilerScratch* csb,
+	const MapNode* map, Array<CompiledMapItem>& items)
+{
+	const FB_SIZE_T count = map->sourceList.getCount();
+	fb_assert(count == map->targetList.getCount());
+
+	items.resize(count);
+
+	for (FB_SIZE_T i = 0; i < count; i++)
+	{
+		CompiledMapItem& item = items[i];
+		item.source = map->sourceList[i];
+		item.target = map->targetList[i];
+
+		const ValueExprNode* const sourceNode = item.source;
+		const ValueExprNode* const targetNode = item.target;
+
+		const FieldNode* const srcField = nodeAs<FieldNode>(sourceNode);
+		const FieldNode* const dstField = nodeAs<FieldNode>(targetNode);
+
+		if (!srcField || !dstField || srcField->cursorNumber.has_value())
+			continue;
+
+		if (dstField->fieldStream != m_stream || !m_format)
+			continue;
+
+		const Format* const srcFormat = CMP_format(tdbb, csb, srcField->fieldStream);
+
+		if (!srcFormat ||
+			srcField->fieldId >= srcFormat->fmt_desc.getCount() ||
+			dstField->fieldId >= m_format->fmt_desc.getCount())
+		{
+			continue;
+		}
+
+		const dsc& srcDesc = srcFormat->fmt_desc[srcField->fieldId];
+		const dsc& dstDesc = m_format->fmt_desc[dstField->fieldId];
+
+		if (srcDesc.isUnknown() || dstDesc.isUnknown())
+			continue;
+
+		// Blobs require blb::move for ownership transfer and cstrings have
+		// non-trivial length semantics: keep the generic path for them.
+		if (srcDesc.isBlob() || srcDesc.dsc_dtype == dtype_cstring)
+			continue;
+
+		if (!DSC_EQUIV(&srcDesc, &dstDesc, false))
+			continue;
+
+		item.srcFormat = srcFormat;
+		item.srcStream = srcField->fieldStream;
+		item.srcFieldId = srcField->fieldId;
+		item.dstFieldId = dstField->fieldId;
+		item.srcOffset = (ULONG) (IPTR) srcDesc.dsc_address;
+		item.dstOffset = (ULONG) (IPTR) dstDesc.dsc_address;
+		item.length = srcDesc.dsc_length;
 	}
 }
 
@@ -119,15 +190,32 @@ bool Union::internalGetRecord(thread_db* tdbb) const
 
 	// We've got a record, map it into the target record
 
-	const MapNode* const map = m_maps[impure->irsb_count];
-	const NestConst<ValueExprNode>* const sourceEnd = map->sourceList.end();
+	const Array<CompiledMapItem>& items = m_compiledMaps[impure->irsb_count];
+	Record* const record = rpb->rpb_record;
 
-	for (const NestConst<ValueExprNode>* source = map->sourceList.begin(),
-			*target = map->targetList.begin();
-		 source != sourceEnd;
-		 ++source, ++target)
+	for (const auto& item : items)
 	{
-		EXE_assignment(tdbb, *source, *target);
+		if (item.srcFormat)
+		{
+			const record_param& srcRpb = request->req_rpb[item.srcStream];
+			Record* const srcRecord = srcRpb.rpb_record;
+
+			if (srcRecord && srcRecord->getFormat() == item.srcFormat)
+			{
+				if (srcRecord->isNull(item.srcFieldId))
+					record->setNull(item.dstFieldId);
+				else
+				{
+					memcpy(record->getData() + item.dstOffset,
+						srcRecord->getData() + item.srcOffset, item.length);
+					record->clearNull(item.dstFieldId);
+				}
+
+				continue;
+			}
+		}
+
+		EXE_assignment(tdbb, item.source, item.target);
 	}
 
 	rpb->rpb_number.setValid(true);

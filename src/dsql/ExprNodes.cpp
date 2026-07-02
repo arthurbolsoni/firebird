@@ -4153,11 +4153,101 @@ ValueExprNode* ConcatenateNode::pass2(thread_db* tdbb, CompilerScratch* csb)
 	getDesc(tdbb, csb, &desc);
 	impureOffset = csb->allocImpure<impure_value>();
 
+	dsc desc1, desc2;
+	arg1->getDesc(tdbb, csb, &desc1);
+	arg2->getDesc(tdbb, csb, &desc2);
+
+	flatten = !desc1.isBlob() && !desc2.isBlob() &&
+		desc1.dsc_dtype != dtype_dbkey && desc2.dsc_dtype != dtype_dbkey;
+
 	return this;
 }
 
 dsc* ConcatenateNode::execute(thread_db* tdbb, Request* request) const
 {
+	// A chain of flattenable concatenations (typically a || b || c || ...) is
+	// evaluated in a single pass over the leaf values, with a single result
+	// allocation, instead of materializing every intermediate node.
+	if (flatten && nodeIs<ConcatenateNode>(arg1.getObject()))
+	{
+		HalfStaticArray<const ConcatenateNode*, 16> spine;
+		const ValueExprNode* leftmost = this;
+
+		while (true)
+		{
+			const ConcatenateNode* const chain = nodeAs<ConcatenateNode>(leftmost);
+			if (!chain || !chain->flatten)
+				break;
+
+			spine.push(chain);
+			leftmost = chain->arg1;
+		}
+
+		// Evaluate the leaves in the left-to-right order
+
+		HalfStaticArray<const dsc*, 16> values;
+		bool anyNull = false;
+
+		const dsc* value = EVL_expr(tdbb, request, leftmost);
+		anyNull |= !value;
+		values.push(value);
+
+		for (FB_SIZE_T i = spine.getCount(); i--; )
+		{
+			value = EVL_expr(tdbb, request, spine[i]->arg2);
+			anyNull |= !value;
+			values.push(value);
+		}
+
+		if (anyNull)
+			return nullptr;
+
+		// Fold the result descriptor pairwise, the same way the nested
+		// evaluation would. Flattenable arguments are never blobs, so the
+		// result is always a string.
+
+		DataTypeUtil dataTypeUtil(tdbb);
+		dsc folded;
+		dataTypeUtil.makeConcatenate(&folded, values[0], values[1]);
+
+		for (FB_SIZE_T i = 2; i < values.getCount(); ++i)
+		{
+			const dsc prev = folded;
+			dataTypeUtil.makeConcatenate(&folded, &prev, values[i]);
+		}
+
+		fb_assert(folded.dsc_dtype == dtype_varying);
+
+		// Convert each leaf to the result text type, accumulating the data
+
+		HalfStaticArray<UCHAR, 512> data;
+		const auto textType = folded.getTextType();
+
+		for (const dsc* const* ptr = values.begin(); ptr != values.end(); ++ptr)
+		{
+			MoveBuffer temp;
+			UCHAR* address = nullptr;
+			const USHORT length = MOV_make_string2(tdbb, *ptr, textType, &address, temp);
+
+			if ((ULONG) data.getCount() + (ULONG) length > MAX_STR_SIZE)
+				ERR_post(Arg::Gds(isc_concat_overflow));
+
+			if (length)
+				data.add(address, length);
+		}
+
+		impure_value* const impure = request->getImpure<impure_value>(impureOffset);
+
+		folded.dsc_dtype = dtype_text;
+		folded.dsc_length = (USHORT) data.getCount();
+		folded.dsc_address = NULL;
+
+		EVL_make_value(tdbb, &folded, impure);
+		memcpy(impure->vlu_desc.dsc_address, data.begin(), data.getCount());
+
+		return &impure->vlu_desc;
+	}
+
 	const dsc* value1 = EVL_expr(tdbb, request, arg1);
 	const dsc* value2 = EVL_expr(tdbb, request, arg2);
 

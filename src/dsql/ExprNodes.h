@@ -464,6 +464,11 @@ public:
 public:
 	NestConst<ValueExprNode> arg1;
 	NestConst<ValueExprNode> arg2;
+
+	// Set in pass2 when neither argument is a blob nor a dbkey, which allows
+	// a chain of these nodes to be evaluated in a flattened manner (a single
+	// pass over the leaf values with a single memory allocation).
+	bool flatten = false;
 };
 
 

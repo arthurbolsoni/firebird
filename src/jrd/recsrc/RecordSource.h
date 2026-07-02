@@ -1506,8 +1506,30 @@ namespace Jrd
 		bool internalGetRecord(thread_db* tdbb) const override;
 
 	private:
+		// Precompiled map item. When srcFormat is set, the assignment is a
+		// direct field-to-field copy between equivalent descriptors, done as
+		// a raw byte copy plus a null-flag update, bypassing EXE_assignment.
+		// Otherwise (or when the runtime record format does not match
+		// srcFormat), the generic EXE_assignment path is taken.
+		struct CompiledMapItem
+		{
+			NestConst<ValueExprNode> source;
+			NestConst<ValueExprNode> target;
+			const Format* srcFormat = nullptr;
+			ULONG srcOffset = 0;
+			ULONG dstOffset = 0;
+			USHORT length = 0;
+			USHORT srcFieldId = 0;
+			USHORT dstFieldId = 0;
+			StreamType srcStream = 0;
+		};
+
+		void compileMap(thread_db* tdbb, CompilerScratch* csb,
+			const MapNode* map, Firebird::Array<CompiledMapItem>& items);
+
 		Firebird::Array<NestConst<RecordSource> > m_args;
 		Firebird::Array<NestConst<MapNode> > m_maps;
+		Firebird::ObjectsArray<Firebird::Array<CompiledMapItem> > m_compiledMaps;
 		StreamList m_streams;
 	};
 

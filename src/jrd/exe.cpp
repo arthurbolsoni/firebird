@@ -494,9 +494,30 @@ void EXE_assignment(thread_db* tdbb, const ValueExprNode* to, dsc* from_desc,
 		{
 			MOV_move(tdbb, from_desc, to_desc);
 		}
+		else if (from_desc->dsc_dtype == dtype_varying)
+		{
+			// Descriptors are equivalent (same type, length and charset),
+			// so the payload can be copied directly, bypassing the generic
+			// conversion path. Only the actual data length is copied.
+			const vary* const src = (const vary*) from_desc->dsc_address;
+			vary* const dst = (vary*) to_desc->dsc_address;
+			const USHORT maxLen = to_desc->dsc_length - sizeof(USHORT);
+			const USHORT len = MIN(src->vary_length, maxLen);
+
+			dst->vary_length = len;
+			memcpy(dst->vary_string, src->vary_string, len);
+		}
+		else if (from_desc->dsc_dtype == dtype_text)
+		{
+			// Equivalent descriptors have equal lengths, so a fixed-length
+			// string is copied as raw bytes. Sources with a real (unpadded)
+			// length get a shorter dsc_length and thus fail DSC_EQUIV above,
+			// falling into the MOV_move branch which handles the padding.
+			memcpy(to_desc->dsc_address, from_desc->dsc_address, from_desc->dsc_length);
+		}
 		else if (DTYPE_IS_TEXT(from_desc->dsc_dtype))
 		{
-			// Force slow move to properly handle the case when source string is provided with real length instead of padded length
+			// dtype_cstring: keep the generic path
 			MOV_move(tdbb, from_desc, to_desc);
 		}
 		else if (from_desc->dsc_dtype == dtype_short)
@@ -539,6 +560,7 @@ void EXE_assignment(thread_db* tdbb, const ValueExprNode* to, dsc* from_desc,
 			record->setNull(toField->fieldId);
 		else
 			record->clearNull(toField->fieldId);
+
 	}
 	else if (toParam && toParam->argFlag)
 	{
