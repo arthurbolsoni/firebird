@@ -62,6 +62,16 @@ inline constexpr double COST_FACTOR_MEMCOPY = 0.5;
 inline constexpr double COST_FACTOR_HASHING = 0.5;
 inline constexpr double COST_FACTOR_QUICKSORT = 0.1;
 
+// Risk adjustment for the nested loop vs hash join choice in outer joins.
+// A mistaken nested loop join degrades linearly with the actual outer cardinality,
+// which tends to be under-estimated across long join chains (no histograms),
+// while a mistaken hash join costs at most an extra scan of the inner stream.
+// So, if the inner stream is cheap to cache and hash in absolute terms, the
+// nested loop is required to win the cost comparison even against a scaled-up
+// outer cardinality.
+inline constexpr double OUTER_HASH_RISK_MARGIN = 100.0;
+inline constexpr double OUTER_HASH_RISK_MAX_CARDINALITY = 32768.0;
+
 inline constexpr double MAXIMUM_SELECTIVITY = 1.0;
 inline constexpr double DEFAULT_SELECTIVITY = 0.1;
 
@@ -456,7 +466,20 @@ public:
 		return MIN(factor, MAXIMUM_SELECTIVITY);
 	}
 
-	static double estimateSelectivity(const BooleanList& filters, double cardinality = 0, unsigned priorConjuncts = 0);
+	static double estimateSelectivity(CompilerScratch* csb, const BooleanList& filters,
+									  double cardinality = 0, unsigned priorConjuncts = 0,
+									  bool markApplied = false);
+
+	// Register a boolean (decomposing the conjunctions) whose filtering effect is
+	// already accounted for, so that its re-applications at the upper RSE levels
+	// do not affect the cardinality estimations anymore
+	static void markBooleanCounted(CompilerScratch* csb, BoolExprNode* boolean);
+
+	static double estimateSelectivity(const BooleanList& filters, double cardinality = 0,
+									  unsigned priorConjuncts = 0)
+	{
+		return estimateSelectivity(nullptr, filters, cardinality, priorConjuncts);
+	}
 
 	double getDependentSelectivity();
 

@@ -39,6 +39,8 @@ bool	BTR_delete_index(Jrd::thread_db*, Jrd::win*, MetaId, bool);
 bool	BTR_description(Jrd::thread_db*, Jrd::Cached::Relation*, const Ods::index_root_page*, Jrd::index_desc*,
 						MetaId, USHORT flags = 0);
 DSC*	BTR_eval_expression(Jrd::thread_db*, Jrd::index_desc*, Jrd::Record*);
+bool	BTR_estimate_selectivity(Jrd::thread_db*, Jrd::RelationPages*, const Jrd::index_desc*,
+								 const dsc* lowerDesc, const dsc* upperDesc, double& selectivity);
 void	BTR_evaluate(Jrd::thread_db*, const Jrd::IndexRetrieval*, Jrd::RecordBitmap**, Jrd::RecordBitmap*);
 UCHAR*	BTR_find_leaf(Ods::btree_page*, Jrd::temporary_key*, UCHAR*, USHORT*, bool, int);
 Ods::btree_page*	BTR_find_page(Jrd::thread_db*, const Jrd::IndexRetrieval*, Jrd::win*, Jrd::index_desc*,

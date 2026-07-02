@@ -1242,13 +1242,80 @@ double Optimizer::getDependentSelectivity()
 // See also explanation in the middle of Retrieval::makeInversion().
 //
 
-double Optimizer::estimateSelectivity(const BooleanList& filters, double cardinality, unsigned priorConjuncts)
+static bool isCountedBoolean(const CompilerScratch* csb, const BoolExprNode* boolean)
+{
+	for (const auto counted : csb->csb_counted_booleans)
+	{
+		if (counted == boolean || counted->sameAs(boolean, false))
+			return true;
+	}
+
+	return false;
+}
+
+static double getDedupSelectivity(const CompilerScratch* csb, const BoolExprNode* boolean)
+{
+	if (isCountedBoolean(csb, boolean))
+		return MAXIMUM_SELECTIVITY;
+
+	// Conjunctions must be checked per-component, as the very same conjuncts may
+	// reappear (possibly cloned and re-combined) at the upper RSE levels
+
+	const auto binaryNode = nodeAs<BinaryBoolNode>(boolean);
+	if (binaryNode && binaryNode->blrOp == blr_and)
+	{
+		return getDedupSelectivity(csb, binaryNode->arg1) *
+			getDedupSelectivity(csb, binaryNode->arg2);
+	}
+
+	return Optimizer::getSelectivity(boolean);
+}
+
+void Optimizer::markBooleanCounted(CompilerScratch* csb, BoolExprNode* boolean)
+{
+	const auto binaryNode = nodeAs<BinaryBoolNode>(boolean);
+	if (binaryNode && binaryNode->blrOp == blr_and)
+	{
+		markBooleanCounted(csb, binaryNode->arg1);
+		markBooleanCounted(csb, binaryNode->arg2);
+		return;
+	}
+
+	if (!isCountedBoolean(csb, boolean))
+		csb->csb_counted_booleans.add(boolean);
+}
+
+double Optimizer::estimateSelectivity(CompilerScratch* csb, const BooleanList& filters,
+									  double cardinality, unsigned priorConjuncts, bool markApplied)
 {
 	// Get selectivities and order them
 	SortedArray<double, InlineStorage<double, OPT_STATIC_ITEMS> > selectivities;
 
 	for (const auto filter : filters)
+	{
+		// Nested RSE levels re-apply the same (possibly cloned and re-combined)
+		// parent conjuncts as their own filters. A conjunct can only really filter
+		// the rows once, so count its selectivity only for the innermost application,
+		// otherwise the cardinality estimation of deep join chains collapses towards
+		// zero. The conjuncts are registered when a filter is actually generated (as
+		// opposed to the speculative cost estimations, which must stay free of side
+		// effects).
+
+		if (csb)
+		{
+			const auto selectivity = getDedupSelectivity(csb, filter);
+
+			if (markApplied)
+				Optimizer::markBooleanCounted(csb, filter);
+
+			if (selectivity < MAXIMUM_SELECTIVITY)
+				selectivities.add(selectivity);
+
+			continue;
+		}
+
 		selectivities.add(getSelectivity(filter));
+	}
 
 	auto selectivity = MAXIMUM_SELECTIVITY;
 
@@ -3074,6 +3141,13 @@ RecordSource* Optimizer::generateRetrieval(StreamType stream,
 			scanSelectivity = candidate->matchSelectivity;
 			filterSelectivity = candidate->filterSelectivity;
 
+			// The selectivity of the matched booleans is already accounted for by
+			// this retrieval, so their re-applications at the upper RSE levels must
+			// not affect the cardinality estimations anymore
+
+			for (const auto match : candidate->matches)
+				markBooleanCounted(csb, match);
+
 			// Just for safety sake, this condition must be already checked
 			// inside OptimizerRetrieval::matchOnIndexes()
 
@@ -3145,7 +3219,7 @@ RecordSource* Optimizer::generateRetrieval(StreamType stream,
 
 	if (rsb)
 	{
-		filterSelectivity = Optimizer::estimateSelectivity(filters, rsb->getCardinality());
+		filterSelectivity = Optimizer::estimateSelectivity(csb, filters, rsb->getCardinality(), 0, true);
 	}
 	else
 	{
@@ -3187,7 +3261,7 @@ RecordSource* Optimizer::applyBoolean(RecordSource* rsb, ConjunctIterator& iter)
 
 	if (const auto boolean = composeBoolean(iter, filters))
 	{
-		const auto selectivity = estimateSelectivity(filters, rsb->getCardinality());
+		const auto selectivity = estimateSelectivity(csb, filters, rsb->getCardinality(), 0, true);
 		rsb = FB_NEW_POOL(getPool()) FilteredStream(csb, rsb, boolean, selectivity);
 	}
 
@@ -3235,7 +3309,7 @@ RecordSource* Optimizer::applyResidualBoolean(RecordSource* rsb)
 		}
 	}
 
-	const auto selectivity = estimateSelectivity(filters, rsb->getCardinality());
+	const auto selectivity = estimateSelectivity(csb, filters, rsb->getCardinality(), 0, true);
 
 	return boolean ? FB_NEW_POOL(getPool()) FilteredStream(csb, rsb, boolean, selectivity) : rsb;
 }

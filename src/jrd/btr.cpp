@@ -3054,6 +3054,253 @@ void BTR_reserve_slot(thread_db* tdbb, IndexCreation& creation, IndexCreateLock&
 }
 
 
+static bool estimate_key_fraction(thread_db* tdbb, RelationPages* relPages,
+								  const index_desc* idx, const temporary_key* key,
+								  double& fraction)
+{
+/**************************************
+ *
+ *	e s t i m a t e _ k e y _ f r a c t i o n
+ *
+ **************************************
+ *
+ * Functional description
+ *	Estimate the fraction of the index keys sorting strictly below the given
+ *	key. The B-tree is descended from the root down to the leaf level, looking
+ *	at the fractional position of the key on every page along the way. The
+ *	accuracy improves by roughly a page fanout factor per level descended.
+ *	Only ascending single-segment indexes are supported (checked by the caller).
+ *
+ **************************************/
+	WIN window(relPages->rel_pg_space_id, idx->idx_root);
+	btree_page* page = (btree_page*) CCH_FETCH(tdbb, &window, LCK_read, pag_index);
+
+	double base = 0;	// fraction accumulated at the upper levels
+	double weight = 1;	// weight of a single node at the current level
+
+	while (true)
+	{
+		const bool leafPage = (page->btr_level == 0);
+
+		UCHAR* pointer = page->btr_nodes + page->btr_jump_size;
+		const UCHAR* endPointer = (UCHAR*) page + page->btr_length;
+
+		IndexNode node;
+		pointer = node.readNode(pointer, leafPage);
+
+		ULONG count = 0, position = 0;
+		ULONG descendPage = 0;
+		bool passed = false;
+
+		USHORT prefix = 0;
+		const UCHAR* p = key->key_data;
+		const UCHAR* const keyEnd = key->key_data + key->key_length;
+
+		while (true)
+		{
+			if (pointer > endPointer)
+			{
+				// Index looks inconsistent, don't bugcheck just for an estimate
+				CCH_RELEASE(tdbb, &window);
+				return false;
+			}
+
+			if (node.isEndLevel)
+				break;
+
+			if (node.isEndBucket)
+			{
+				if (passed)
+					break;
+
+				// Our key is beyond this page, continue on the sibling page
+				// and restart the counting
+
+				page = (btree_page*) CCH_HANDOFF(tdbb, &window, page->btr_sibling,
+												 LCK_read, pag_index);
+
+				pointer = page->btr_nodes + page->btr_jump_size;
+				endPointer = (UCHAR*) page + page->btr_length;
+				pointer = node.readNode(pointer, leafPage);
+
+				count = position = descendPage = 0;
+				prefix = 0;
+				p = key->key_data;
+				continue;
+			}
+
+			count++;
+
+			if (!passed)
+			{
+				bool nodeIsLower;
+
+				if (node.prefix < prefix)
+				{
+					// The node shares fewer bytes with our key than its
+					// predecessors, so it must be greater than the key
+					nodeIsLower = false;
+				}
+				else if (node.prefix > prefix)
+				{
+					// The node duplicates more leading bytes of its (lower)
+					// predecessor than our key does, so it's lower than the key
+					nodeIsLower = true;
+				}
+				else
+				{
+					// Compare the tails
+					const UCHAR* q = node.data;
+					const UCHAR* const nodeEnd = q + node.length;
+
+					while (true)
+					{
+						if (p == keyEnd)
+						{
+							nodeIsLower = false;	// node >= key
+							break;
+						}
+
+						if (q == nodeEnd || *p > *q)
+						{
+							nodeIsLower = true;		// node < key
+							break;
+						}
+
+						if (*p++ < *q++)
+						{
+							nodeIsLower = false;	// node > key
+							break;
+						}
+					}
+
+					prefix = (USHORT) (p - key->key_data);
+				}
+
+				if (nodeIsLower)
+				{
+					if (!leafPage)
+						descendPage = node.pageNumber;
+				}
+				else
+				{
+					passed = true;
+					position = count - 1;
+				}
+			}
+
+			pointer = node.readNode(pointer, leafPage);
+		}
+
+		if (!count)
+		{
+			CCH_RELEASE(tdbb, &window);
+			return false;
+		}
+
+		if (!passed)
+			position = count;
+
+		if (leafPage)
+		{
+			base += weight * ((double) position / count);
+			break;
+		}
+
+		if (!descendPage)
+		{
+			// The key sorts below the first node of a non-leaf page. This should
+			// never happen due to the degenerate (zero-length) first node, but
+			// bail out gracefully if it does
+
+			CCH_RELEASE(tdbb, &window);
+			return false;
+		}
+
+		// Nodes positioned strictly below the key represent whole children lying
+		// below it, except the last one which the key itself falls into
+
+		if (position > 0)
+			base += weight * ((double) (position - 1) / count);
+
+		weight /= count;
+
+		page = (btree_page*) CCH_HANDOFF(tdbb, &window, descendPage, LCK_read, pag_index);
+	}
+
+	CCH_RELEASE(tdbb, &window);
+
+	fraction = MIN(MAX(base, 0.0), 1.0);
+	return true;
+}
+
+
+bool BTR_estimate_selectivity(thread_db* tdbb, RelationPages* relPages, const index_desc* idx,
+							  const dsc* lowerDesc, const dsc* upperDesc, double& selectivity)
+{
+/**************************************
+ *
+ *	B T R _ e s t i m a t e _ s e l e c t i v i t y
+ *
+ **************************************
+ *
+ * Functional description
+ *	Estimate the fraction of the index keys lying within the given range
+ *	bounds by probing the index B-tree. Intended to be used at the statement
+ *	preparation time, when the bound values are known (i.e. literals), thus
+ *	replacing the fixed default selectivity factors for range predicates.
+ *	Returns false if the estimation cannot be performed.
+ *
+ **************************************/
+	SET_TDBB(tdbb);
+
+	if ((idx->idx_flags & idx_descending) || idx->idx_count != 1)
+		return false;
+
+	if (!lowerDesc && !upperDesc)
+		return false;
+
+	temporary_key lowerKey, upperKey;
+
+	try
+	{
+		if (lowerDesc)
+		{
+			lowerKey.key_flags = key_empty;
+			lowerKey.key_nulls = 0;
+			compress(tdbb, lowerDesc, 0, &lowerKey, idx->idx_rpt[0].idx_itype,
+					 false, INTL_KEY_SORT, nullptr);
+		}
+
+		if (upperDesc)
+		{
+			upperKey.key_flags = key_empty;
+			upperKey.key_nulls = 0;
+			compress(tdbb, upperDesc, 0, &upperKey, idx->idx_rpt[0].idx_itype,
+					 false, INTL_KEY_SORT, nullptr);
+		}
+	}
+	catch (const Firebird::Exception&)
+	{
+		// The bound value cannot be converted into a key (e.g. a malformed
+		// date literal). Let the runtime report the error, if any.
+		fb_utils::init_status(tdbb->tdbb_status_vector);
+		return false;
+	}
+
+	double lowerFraction = 0, upperFraction = 1;
+
+	if (lowerDesc && !estimate_key_fraction(tdbb, relPages, idx, &lowerKey, lowerFraction))
+		return false;
+
+	if (upperDesc && !estimate_key_fraction(tdbb, relPages, idx, &upperKey, upperFraction))
+		return false;
+
+	selectivity = MAX(upperFraction - lowerFraction, 0.0);
+	return true;
+}
+
+
 void BTR_selectivity(thread_db* tdbb, Cached::Relation* relation, MetaId id, SelectivityList& selectivity)
 {
 /**************************************

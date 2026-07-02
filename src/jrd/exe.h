@@ -483,6 +483,7 @@ public:
 		csb_forCursorNames(p),
 		csb_computing_fields(p),
 		csb_inner_booleans(p),
+		csb_counted_booleans(p),
 		csb_variables_used_in_subroutines(p),
 		csb_pool(p),
 		csb_map_field_info(p),
@@ -586,6 +587,11 @@ public:
 	Firebird::RightPooledMap<ForNode*, MetaName> csb_forCursorNames;
 	Firebird::SortedArray<jrd_fld*> csb_computing_fields;	// Computed fields being compiled
 	Firebird::Array<BoolExprNode*> csb_inner_booleans;	// Inner booleans at the current scope
+	Firebird::Array<BoolExprNode*> csb_counted_booleans;	// Booleans already accounted for in selectivity estimations.
+														// Nested RSE levels re-apply the same (possibly cloned) parent
+														// conjuncts as their own filters, but a conjunct can only really
+														// filter the rows once, so further applications must not affect
+														// the cardinality estimations.
 	Firebird::SortedArray<USHORT> csb_variables_used_in_subroutines;
 	StreamType		csb_n_stream;				// Next available stream
 	USHORT			csb_msg_number;				// Highest used message number

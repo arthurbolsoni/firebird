@@ -1122,11 +1122,51 @@ void Retrieval::getInversionCandidates(InversionCandidateList& inversions,
 								break;
 						}
 
-						// Adjust the compound selectivity using the reduce factor.
-						// It should be better than the previous segment but worse
-						// than a full match.
-						const double diffSelectivity = scratch.selectivity - selectivity;
-						selectivity += (diffSelectivity * factor);
+						bool estimated = false;
+
+						// For a range scan on a single-segment index with constant
+						// bounds, replace the default selectivity factor with the
+						// actual fraction of keys within the range, estimated by
+						// probing the index B-tree. This makes the cardinality
+						// estimation of range-filtered streams (and thus the whole
+						// join order / join algorithm choice) far more realistic.
+
+						if (j == 0 && cardinality > DEFAULT_CARDINALITY &&
+							(scanType == segmentScanBetween ||
+							 scanType == segmentScanLess ||
+							 scanType == segmentScanGreater))
+						{
+							const auto lowerLiteral = nodeAs<LiteralNode>(segment.lowerValue);
+							const auto upperLiteral = nodeAs<LiteralNode>(segment.upperValue);
+
+							const dsc* const lowerDesc = lowerLiteral ? &lowerLiteral->litDesc : nullptr;
+							const dsc* const upperDesc = upperLiteral ? &upperLiteral->litDesc : nullptr;
+
+							// Every present bound must be a literal, and at least one is required
+							if ((!segment.lowerValue || lowerDesc) &&
+								(!segment.upperValue || upperDesc) &&
+								(lowerDesc || upperDesc))
+							{
+								double rangeSelectivity;
+								if (BTR_estimate_selectivity(tdbb, relation()->getPages(tdbb), idx,
+															 lowerDesc, upperDesc, rangeSelectivity))
+								{
+									selectivity = MAX(rangeSelectivity, minSelectivity);
+									selectivity = MIN(selectivity, scratch.selectivity);
+									estimated = true;
+								}
+							}
+						}
+
+						if (!estimated)
+						{
+							// Adjust the compound selectivity using the reduce factor.
+							// It should be better than the previous segment but worse
+							// than a full match.
+							const double diffSelectivity = scratch.selectivity - selectivity;
+							selectivity += (diffSelectivity * factor);
+						}
+
 						fb_assert(selectivity <= scratch.selectivity);
 						scratch.selectivity = selectivity;
 

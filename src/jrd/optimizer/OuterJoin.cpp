@@ -386,7 +386,16 @@ RecordSource* OuterJoin::generateHashJoin(RecordSource* outerRsb, BoolExprNode* 
 			outerCardinality * (COST_FACTOR_HASHING + matchCardinality * COST_FACTOR_MEMCOPY);
 	}
 
-	if (conditional || !allowHashJoin || hashCost > loopCost)
+	// Prefer the hash join if it wins the direct cost comparison. Also prefer it
+	// if the inner stream is cheap to cache and hash in absolute terms and the
+	// nested loop join does not survive a moderate under-estimation of the outer
+	// cardinality (see OUTER_HASH_RISK_MARGIN comments)
+
+	const bool preferHashJoin = (hashCost <= loopCost) ||
+		(hashCardinality <= OUTER_HASH_RISK_MAX_CARDINALITY &&
+			hashCost <= loopCost * OUTER_HASH_RISK_MARGIN);
+
+	if (conditional || !allowHashJoin || !preferHashJoin)
 	{
 		tail->deactivate();
 		return nullptr;
@@ -416,6 +425,12 @@ RecordSource* OuterJoin::generateHashJoin(RecordSource* outerRsb, BoolExprNode* 
 
 	// At least the equi-join conditions found above must be present
 	fb_assert(joinBoolean);
+
+	// The join boolean filters the joined records, so its filtering effect is
+	// already accounted for and its re-applications at the upper RSE levels must
+	// not affect the cardinality estimations anymore
+
+	Optimizer::markBooleanCounted(csb, joinBoolean);
 
 	RecordSource* const args[] = {outerRsb, innerRsb};
 	NestValueArray* const keys[] = {outerKeys, innerKeys};

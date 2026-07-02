@@ -65,7 +65,11 @@ NestedLoopJoin::NestedLoopJoin(CompilerScratch* csb,
 
 	m_impure = csb->allocImpure<Impure>();
 
-	m_cardinality = outer->getCardinality() * inner->getCardinality();
+	// An outer join cannot produce fewer records than its outer sub-stream,
+	// so use its cardinality as the lower bound. This stops the cardinality
+	// under-estimation from being amplified across long join chains.
+	m_cardinality = MAX(outer->getCardinality() * inner->getCardinality(),
+						outer->getCardinality());
 
 	m_args.add(outer);
 	m_args.add(inner);

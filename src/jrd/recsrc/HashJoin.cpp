@@ -377,6 +377,12 @@ void HashJoin::init(thread_db* tdbb, CompilerScratch* csb, FB_SIZE_T count,
 	}
 
 	m_cardinality *= selectivity;
+
+	// An outer join cannot produce fewer records than its leader sub-stream,
+	// so use its cardinality as the lower bound. This stops the cardinality
+	// under-estimation from being amplified across long join chains.
+	if (m_joinType == JoinType::OUTER)
+		m_cardinality = MAX(m_cardinality, m_leader.source->getCardinality());
 }
 
 void HashJoin::internalOpen(thread_db* tdbb) const
