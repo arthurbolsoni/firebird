@@ -136,6 +136,22 @@ class HashJoin::HashTable final : public PermanentStorage
 	};
 
 public:
+	// Pick a hash table size based on the actual number of cached records,
+	// targeting a modest number of collisions per bucket. Larger streams get
+	// larger tables to avoid linear/binary searching across huge collision lists.
+	static ULONG pickSize(ULONG count) noexcept
+	{
+		static constexpr ULONG primes[] = {HASH_SIZE, 8191, 65521, 524287};
+
+		for (const auto prime : primes)
+		{
+			if (count <= prime * BUCKET_PREALLOCATE_SIZE)
+				return prime;
+		}
+
+		return primes[FB_NELEM(primes) - 1];
+	}
+
 	HashTable(MemoryPool& pool, ULONG streamCount, ULONG tableSize = HASH_SIZE)
 		: PermanentStorage(pool), m_streamCount(streamCount),
 		  m_tableSize(tableSize), m_slot(0)
@@ -253,7 +269,8 @@ HashJoin::HashJoin(thread_db* tdbb, CompilerScratch* csb, JoinType joinType,
 				   FB_SIZE_T count, RecordSource* const* args, NestValueArray* const* keys,
 				   double selectivity)
 	: Join(csb, count, joinType),
-	  m_subs(csb->csb_pool, count - 1)
+	  m_subs(csb->csb_pool, count - 1),
+	  m_joinBoolean(nullptr)
 {
 	fb_assert(count >= 2);
 
@@ -261,11 +278,12 @@ HashJoin::HashJoin(thread_db* tdbb, CompilerScratch* csb, JoinType joinType,
 }
 
 HashJoin::HashJoin(thread_db* tdbb, CompilerScratch* csb,
-				   BoolExprNode* boolean,
+				   BoolExprNode* boolean, BoolExprNode* joinBoolean,
 				   RecordSource* const* args, NestValueArray* const* keys,
 				   double selectivity)
 	: Join(csb, 2, JoinType::OUTER, boolean),
-	  m_subs(csb->csb_pool, 1)
+	  m_subs(csb->csb_pool, 1),
+	  m_joinBoolean(joinBoolean)
 {
 	init(tdbb, csb, 2, args, keys, selectivity);
 }
@@ -434,16 +452,20 @@ bool HashJoin::internalGetRecord(thread_db* tdbb) const
 				auto& pool = *tdbb->getDefaultPool();
 				const auto argCount = m_subs.getCount();
 
-				impure->irsb_hash_table = FB_NEW_POOL(pool) HashTable(pool, argCount);
 				impure->irsb_leader_buffer = FB_NEW_POOL(pool) UCHAR[m_leader.totalKeyLength];
 
 				UCharBuffer buffer(pool);
 
+				// Read and cache the inner streams, hashing the join condition values.
+				// The hash table is allocated after the caching, when the actual number
+				// of records is known, thus allowing to size the table appropriately.
+
+				HalfStaticArray<ULONG, 256> hashes(pool);
+				HalfStaticArray<ULONG, 8> counts(pool);
+				ULONG maxCount = 0;
+
 				for (FB_SIZE_T i = 0; i < argCount; i++)
 				{
-					// Read and cache the inner streams. While doing that,
-					// hash the join condition values and populate hash tables.
-
 					m_subs[i].buffer->open(tdbb);
 
 					ULONG counter = 0;
@@ -451,9 +473,22 @@ bool HashJoin::internalGetRecord(thread_db* tdbb) const
 
 					while (m_subs[i].buffer->getRecord(tdbb))
 					{
-						const auto hash = computeHash(tdbb, request, m_subs[i], keyBuffer);
-						impure->irsb_hash_table->put(i, hash, counter++);
+						hashes.add(computeHash(tdbb, request, m_subs[i], keyBuffer));
+						counter++;
 					}
+
+					counts.add(counter);
+					maxCount = MAX(maxCount, counter);
+				}
+
+				impure->irsb_hash_table = FB_NEW_POOL(pool)
+					HashTable(pool, argCount, HashTable::pickSize(maxCount));
+
+				const ULONG* hashPtr = hashes.begin();
+				for (FB_SIZE_T i = 0; i < argCount; i++)
+				{
+					for (ULONG position = 0; position < counts[i]; position++)
+						impure->irsb_hash_table->put(i, *hashPtr++, position);
 				}
 
 				impure->irsb_hash_table->sort();
@@ -497,6 +532,23 @@ bool HashJoin::internalGetRecord(thread_db* tdbb) const
 				}
 			}
 
+			// Re-check the join condition to reject false candidates
+			// (hash collisions and non-equi condition mismatches)
+
+			if (found && m_joinBoolean)
+			{
+				fb_assert(m_joinType == JoinType::OUTER);
+
+				while (m_joinBoolean->execute(tdbb, request) != TriState(true))
+				{
+					if (!fetchRecord(tdbb, impure, m_subs.getCount() - 1))
+					{
+						found = false;
+						break;
+					}
+				}
+			}
+
 			if (!found)
 			{
 				impure->irsb_flags |= irsb_mustread;
@@ -520,11 +572,32 @@ bool HashJoin::internalGetRecord(thread_db* tdbb) const
 
 			impure->irsb_flags &= ~irsb_first;
 		}
-		else if (!fetchRecord(tdbb, impure, m_subs.getCount() - 1))
+		else
 		{
-			fb_assert(m_joinType == JoinType::INNER);
-			impure->irsb_flags |= irsb_mustread;
-			continue;
+			bool found = fetchRecord(tdbb, impure, m_subs.getCount() - 1);
+
+			// Skip the false candidates here as well. Note: at least one real match
+			// has been already returned for the current leader record, so finding
+			// no more matches here simply advances the leader stream.
+
+			if (found && m_joinBoolean)
+			{
+				while (m_joinBoolean->execute(tdbb, request) != TriState(true))
+				{
+					if (!fetchRecord(tdbb, impure, m_subs.getCount() - 1))
+					{
+						found = false;
+						break;
+					}
+				}
+			}
+
+			if (!found)
+			{
+				fb_assert(m_joinType == JoinType::INNER || m_joinType == JoinType::OUTER);
+				impure->irsb_flags |= irsb_mustread;
+				continue;
+			}
 		}
 
 		break;

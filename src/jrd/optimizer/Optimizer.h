@@ -1019,6 +1019,7 @@ public:
 
 private:
 	RecordSource* process();
+	RecordSource* generateHashJoin(RecordSource* outerRsb, BoolExprNode* boolean);
 
 	thread_db* const tdbb;
 	Optimizer* const optimizer;

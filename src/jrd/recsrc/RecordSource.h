@@ -1370,7 +1370,7 @@ namespace Jrd
 				 FB_SIZE_T count, RecordSource* const* args, NestValueArray* const* keys,
 				 double selectivity = 0);
 		HashJoin(thread_db* tdbb, CompilerScratch* csb,
-				 BoolExprNode* boolean,
+				 BoolExprNode* boolean, BoolExprNode* joinBoolean,
 				 RecordSource* const* args, NestValueArray* const* keys,
 				 double selectivity = 0);
 
@@ -1394,6 +1394,12 @@ namespace Jrd
 
 		SubStream m_leader;
 		Firebird::Array<SubStream> m_subs;
+
+		// Extra join condition (equality re-check against possible hash collisions
+		// plus remaining non-equi join conditions) evaluated for every candidate
+		// match. Used for outer joins only, where a filter above the join would
+		// break the null-extension semantics.
+		const NestConst<BoolExprNode> m_joinBoolean;
 	};
 
 	class MergeJoin : public Join<SortedStream>
